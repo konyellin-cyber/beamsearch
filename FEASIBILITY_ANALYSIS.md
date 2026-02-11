@@ -63,7 +63,165 @@
 
 ---
 
-## 3. TensorFlow 实现概述
+## 3. GPU 计算流程图
+
+### 整体流程（GPU vs CPU）
+
+```mermaid
+graph TD
+    A["输入：2000 候选 + 已选序列"] -->|CPU| B["初始化"]
+    B -->|GPU| C["位置 0 的 GPU 计算"]
+    C -->|CPU| D["选择最高分"]
+    D -->|CPU| E["更新已选序列"]
+    E -->|GPU| F["位置 1 的 GPU 计算"]
+    F -->|CPU| G["选择最高分"]
+    G -->|CPU| H["更新已选序列"]
+    H -->|...| I["位置 99"]
+    I -->|CPU| J["输出 100 items"]
+    
+    style C fill:#90EE90
+    style F fill:#90EE90
+    style I fill:#90EE90
+    style D fill:#FFB6C1
+    style G fill:#FFB6C1
+    style J fill:#FFB6C1
+```
+
+### 单个位置的详细流程（GPU 并行）
+
+```mermaid
+graph TD
+    A["位置 pos：已有 pos 个 items<br/>剩余 2000-pos 个候选"] --> B["GPU 内存准备"]
+    
+    B --> C["Phase 1: GPU 规则检查（并行）"]
+    
+    C --> C1["坑位规则<br/>candidate[:, feature] != forbidden"]
+    C --> C2["窗口规则<br/>广播比较 + 求和"]
+    C --> C3["折损规则<br/>heat_count 计算"]
+    
+    C1 --> C4["融合为一个<br/>valid_mask"]
+    C2 --> C4
+    C3 --> C4
+    
+    C4 --> D["Phase 2: GPU 评分计算"]
+    D --> D1["candidate_features @ user_features<br/>= scores"]
+    
+    D1 --> E["Phase 3: GPU 应用掩码"]
+    E --> E1["masked_scores = where<br/>valid_mask, scores, -inf"]
+    
+    E1 --> F["Phase 4: GPU 选择"]
+    F --> F1["best_idx = argmax<br/>masked_scores"]
+    
+    F1 --> G["Phase 5: CPU 同步"]
+    G --> G1["转回 CPU<br/>best_idx 仅 1 个 int"]
+    
+    G1 --> H["CPU 更新"]
+    H --> H1["result.append<br/>candidates[best_idx]"]
+    
+    H1 --> I["位置推进"]
+    
+    style C fill:#90EE90
+    style D fill:#90EE90
+    style E fill:#90EE90
+    style F fill:#90EE90
+    style G4 fill:#FFB6C1
+    style H fill:#FFB6C1
+```
+
+### 窗口规则的 GPU 计算（最关键）
+
+```mermaid
+graph LR
+    A["已选序列<br/>5 items<br/>category_ids<br/>shape: 5"] -->|reshape| B["(5,1)"]
+    C["所有候选<br/>2000 items<br/>category_ids<br/>shape: 2000"] -->|reshape| D["(1,2000)"]
+    
+    B -->|广播比较| E["matches<br/>(5, 2000)"]
+    D -->|广播比较| E
+    
+    E -->|cast to int32| F["matches_int<br/>(5, 2000)"]
+    F -->|reduce_sum<br/>axis=0| G["match_counts<br/>shape: 2000<br/>每个候选的匹配次数"]
+    
+    G -->|<= max_count| H["valid_mask<br/>shape: 2000<br/>bool 数组"]
+    
+    style A fill:#87CEEB
+    style C fill:#87CEEB
+    style E fill:#FFD700
+    style G fill:#FFD700
+    style H fill:#90EE90
+```
+
+### 数据流转与同步
+
+```mermaid
+graph TD
+    A["CPU 内存"] -->|首次：80KB| B["GPU 内存<br/>候选特征"]
+    C["CPU 内存<br/>已选序列"] -->|每次位置：4KB| D["GPU 内存<br/>已选维度"]
+    
+    B -->|计算| E["GPU 计算<br/>3-5ms"]
+    D -->|计算| E
+    
+    E -->|结果：2KB<br/>valid_mask| F["CPU 内存<br/>有效掩码"]
+    
+    F -->|CPU 逻辑| G["选择最高分"]
+    G -->|1 个 int| H["CPU 内存<br/>best_idx"]
+    
+    H -->|更新| C
+    
+    style A fill:#FFE4E1
+    style B fill:#87CEEB
+    style D fill:#87CEEB
+    style E fill:#90EE90
+    style F fill:#FFE4E1
+    style G fill:#FFE4E1
+    style H fill:#FFE4E1
+```
+
+### 三类规则的 GPU 计算
+
+```mermaid
+graph TD
+    A["候选集：2000 items"] --> B["规则检查"]
+    
+    B --> B1["坑位规则<br/>if position == target<br/>  candidate[feature] != forbidden"]
+    B --> B2["窗口规则<br/>广播比较<br/>match_counts = reduce_sum<br/>match_counts < max_count"]
+    B --> B3["折损规则<br/>heat_count = sum is_heat<br/>ratio = heat_count/window<br/>ratio <= threshold"]
+    
+    B1 --> C["GPU 并行<br/>2000 个线程"]
+    B2 --> C
+    B3 --> C
+    
+    C --> D["all_valid<br/>= valid1 & valid2 & valid3"]
+    D --> E["输出：bool[2000]<br/>标记有效候选"]
+    
+    style C fill:#90EE90
+    style E fill:#FFD700
+```
+
+### 性能瓶颈分析
+
+```mermaid
+graph LR
+    A["CPU 20-30ms"] --> A1["规则检查：15ms<br/>条件判断多，分支复杂"]
+    A --> A2["评分计算：5-10ms<br/>2000 个候选的矩阵操作"]
+    A --> A3["同步开销：1-2ms<br/>内存传输"]
+    
+    B["GPU 3-5ms"] --> B1["规则检查：2-3ms<br/>并行条件判断"]
+    B --> B2["评分计算：0.5-1ms<br/>并行矩阵操作"]
+    B --> B3["同步开销：1-2ms<br/>内存传输"]
+    
+    A1 -->|7.5x| B1
+    A2 -->|10x| B2
+    A3 -->|不变| B3
+    
+    style A fill:#FFB6C1
+    style B fill:#90EE90
+    style B1 fill:#FFD700
+    style B2 fill:#FFD700
+```
+
+---
+
+## 4. TensorFlow 实现概述
 
 ### 伪代码
 
@@ -145,7 +303,7 @@ def check_all_rules(result_dims, candidate_dims, position):
 
 ---
 
-## 4. 信息需求
+## 5. 信息需求
 
 ### 必须提供
 
@@ -192,7 +350,7 @@ def check_all_rules(result_dims, candidate_dims, position):
 
 ---
 
-## 5. 预期与下一步
+## 6. 预期与下一步
 
 ### 预期
 
